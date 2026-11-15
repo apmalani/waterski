@@ -25,14 +25,31 @@ usage:
   waterski log [trace]             print the detailed log
   waterski list                    list the scenarios
 
+a trace is JSON lines, or a waveform (.vcd) read as "wave" in waterski.json says.
 every command takes -config <file> (default waterski.json); view also takes
 -frame <time> -size <cols>x<rows> to print a single frame instead of playing`
 
 // Config is waterski.json: how to run a project's simulations and how to describe its messages.
 type Config struct {
-	Trace     string            `json:"trace"`     // where scenarios write their trace
-	Scenarios map[string]string `json:"scenarios"` // shell commands; {trace} is replaced by the trace path
-	Profile   Profile           `json:"profile"`
+	Trace     string              `json:"trace"` // where scenarios write their trace
+	Scenarios map[string]Scenario `json:"scenarios"`
+	Profile   Profile             `json:"profile"`
+	Wave      *WaveConfig         `json:"wave"`
+}
+
+// Scenario is a shell command; {trace} in it is replaced by the trace path. In waterski.json it
+// is just the command, or {"run": command, "trace": path} to write somewhere else than "trace".
+type Scenario struct {
+	Run   string `json:"run"`
+	Trace string `json:"trace"`
+}
+
+func (s *Scenario) UnmarshalJSON(b []byte) error {
+	if json.Unmarshal(b, &s.Run) == nil {
+		return nil
+	}
+	type plain Scenario
+	return json.Unmarshal(b, (*plain)(s))
 }
 
 func main() {
@@ -68,31 +85,38 @@ func run(args []string) error {
 	switch cmd {
 	case "list":
 		for _, name := range scenarioNames(cfg) {
-			fmt.Printf("%-12s %s\n", name, cfg.Scenarios[name])
+			fmt.Printf("%-12s %s\n", name, cfg.Scenarios[name].Run)
 		}
 		return nil
 	case "run":
 		if fl.NArg() != 1 {
 			return fmt.Errorf("run needs one scenario: %s", strings.Join(scenarioNames(cfg), ", "))
 		}
-		if err := runScenario(cfg, fl.Arg(0), tracePath); err != nil {
+		sc, ok := cfg.Scenarios[fl.Arg(0)]
+		if !ok {
+			return fmt.Errorf("no scenario %q (have: %s)", fl.Arg(0), strings.Join(scenarioNames(cfg), ", "))
+		}
+		if sc.Trace != "" {
+			tracePath = sc.Trace
+		}
+		if err := runScenario(fl.Arg(0), sc.Run, tracePath); err != nil {
 			return err
 		}
 		if *asLog {
-			return printLog(tracePath, cfg.Profile)
+			return printLog(tracePath, cfg)
 		}
-		return play(tracePath, cfg.Profile)
+		return play(tracePath, cfg)
 	case "view", "log":
 		if fl.NArg() > 0 {
 			tracePath = fl.Arg(0)
 		}
 		if cmd == "log" {
-			return printLog(tracePath, cfg.Profile)
+			return printLog(tracePath, cfg)
 		}
 		if *at >= 0 {
-			return printFrame(tracePath, cfg.Profile, *at, *size)
+			return printFrame(tracePath, cfg, *at, *size)
 		}
-		return play(tracePath, cfg.Profile)
+		return play(tracePath, cfg)
 	}
 	return fmt.Errorf("unknown command %q\n\n%s", cmd, usage)
 }
@@ -126,11 +150,7 @@ func scenarioNames(cfg Config) []string {
 	return names
 }
 
-func runScenario(cfg Config, name, tracePath string) error {
-	script, ok := cfg.Scenarios[name]
-	if !ok {
-		return fmt.Errorf("no scenario %q (have: %s)", name, strings.Join(scenarioNames(cfg), ", "))
-	}
+func runScenario(name, script, tracePath string) error {
 	if err := os.MkdirAll(filepath.Dir(tracePath), 0o755); err != nil {
 		return err
 	}
@@ -147,7 +167,13 @@ func runScenario(cfg Config, name, tracePath string) error {
 	return nil
 }
 
-func load(path string) (*Trace, error) {
+func load(path string, cfg Config) (*Trace, error) {
+	if strings.EqualFold(filepath.Ext(path), ".vcd") {
+		if cfg.Wave == nil {
+			return nil, fmt.Errorf("%s: reading a waveform needs \"wave\" in waterski.json", path)
+		}
+		return readVCD(path, cfg.Wave, cfg.Profile)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -160,21 +186,21 @@ func load(path string) (*Trace, error) {
 	return tr, nil
 }
 
-func play(path string, pf Profile) error {
-	tr, err := load(path)
+func play(path string, cfg Config) error {
+	tr, err := load(path, cfg)
 	if err != nil {
 		return err
 	}
-	_, err = tea.NewProgram(newModel(tr, pf), tea.WithAltScreen()).Run()
+	_, err = tea.NewProgram(newModel(tr, cfg.Profile), tea.WithAltScreen()).Run()
 	return err
 }
 
-func printFrame(path string, pf Profile, at float64, size string) error {
-	tr, err := load(path)
+func printFrame(path string, cfg Config, at float64, size string) error {
+	tr, err := load(path, cfg)
 	if err != nil {
 		return err
 	}
-	m := newModel(tr, pf)
+	m := newModel(tr, cfg.Profile)
 	if _, err := fmt.Sscanf(size, "%dx%d", &m.w, &m.h); err != nil {
 		return fmt.Errorf("bad -size %q: want <cols>x<rows>", size)
 	}
@@ -183,11 +209,12 @@ func printFrame(path string, pf Profile, at float64, size string) error {
 	return nil
 }
 
-func printLog(path string, pf Profile) error {
-	tr, err := load(path)
+func printLog(path string, cfg Config) error {
+	tr, err := load(path, cfg)
 	if err != nil {
 		return err
 	}
+	pf := cfg.Profile
 	for _, e := range tr.Entries {
 		t := fmtTime(e.T, tr.Unit, tr.End)
 		switch e.Kind {

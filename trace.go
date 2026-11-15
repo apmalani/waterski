@@ -96,15 +96,7 @@ func (tr *Trace) node(id string) *Node {
 }
 
 func parseTrace(r io.Reader) (*Trace, error) {
-	tr := &Trace{Unit: "ns", nodes: map[string]*Node{}}
-	byID := map[int64]*Packet{}
-	seen := map[string]bool{"": true}
-	addFlow := func(f string) {
-		if !seen[f] {
-			seen[f] = true
-			tr.Flows = append(tr.Flows, f)
-		}
-	}
+	var evs []event
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	for n := 1; sc.Scan(); n++ {
@@ -116,6 +108,27 @@ func parseTrace(r io.Reader) (*Trace, error) {
 		if err := json.Unmarshal(line, &e); err != nil {
 			return nil, fmt.Errorf("line %d: %v", n, err)
 		}
+		evs = append(evs, e)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return buildTrace(evs)
+}
+
+// buildTrace turns events, in order, into the model the player shows.
+func buildTrace(evs []event) (*Trace, error) {
+	tr := &Trace{Unit: "ns", nodes: map[string]*Node{}}
+	byID := map[int64]*Packet{}
+	seen := map[string]bool{"": true}
+	addFlow := func(f string) {
+		if !seen[f] {
+			seen[f] = true
+			tr.Flows = append(tr.Flows, f)
+		}
+	}
+	for i, e := range evs {
+		n := i + 1
 		switch e.Ev {
 		case "meta":
 			if e.Title != "" {
@@ -126,7 +139,7 @@ func parseTrace(r io.Reader) (*Trace, error) {
 			}
 		case "node":
 			if e.Node == "" {
-				return nil, fmt.Errorf("line %d: node event without \"node\"", n)
+				return nil, fmt.Errorf("event %d: node event without \"node\"", n)
 			}
 			nd := tr.node(e.Node)
 			if e.Label != "" {
@@ -137,10 +150,10 @@ func parseTrace(r io.Reader) (*Trace, error) {
 			}
 		case "send":
 			if byID[e.ID] != nil {
-				return nil, fmt.Errorf("line %d: packet id %d sent twice", n, e.ID)
+				return nil, fmt.Errorf("event %d: packet id %d sent twice", n, e.ID)
 			}
 			if e.Src == "" || e.Dst == "" {
-				return nil, fmt.Errorf("line %d: send needs \"src\" and \"dst\"", n)
+				return nil, fmt.Errorf("event %d: send needs \"src\" and \"dst\"", n)
 			}
 			tr.node(e.Src)
 			tr.node(e.Dst)
@@ -152,7 +165,7 @@ func parseTrace(r io.Reader) (*Trace, error) {
 		case "recv", "drop":
 			p := byID[e.ID]
 			if p == nil {
-				return nil, fmt.Errorf("line %d: %s for unknown packet id %d", n, e.Ev, e.ID)
+				return nil, fmt.Errorf("event %d: %s for unknown packet id %d", n, e.Ev, e.ID)
 			}
 			if e.Ev == "recv" {
 				p.Recv, p.Arrived = e.T, true
@@ -169,12 +182,9 @@ func parseTrace(r io.Reader) (*Trace, error) {
 			tr.Entries = append(tr.Entries, Entry{T: e.T, Kind: 'n', N: nt})
 			addFlow(e.Flow)
 		default:
-			return nil, fmt.Errorf("line %d: unknown event %q", n, e.Ev)
+			return nil, fmt.Errorf("event %d: unknown event %q", n, e.Ev)
 		}
 		tr.End = max(tr.End, e.T)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
 	}
 	sort.SliceStable(tr.Entries, func(i, j int) bool { return tr.Entries[i].T < tr.Entries[j].T })
 

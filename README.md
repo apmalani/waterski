@@ -1,8 +1,8 @@
 # waterski
 
 Replay network simulations in the terminal: a diagram of the nodes with messages moving between
-them, next to a detailed log of every message. It works with anything that can write a trace:
-FPGA testbenches, network simulators, or logs from real hardware.
+them, next to a detailed log of every message. It reads a JSON-lines trace that anything can
+write (FPGA testbenches, network simulators, logs from real hardware), or a waveform (`.vcd`).
 
 ```
 go install github.com/apmalani/waterski@latest
@@ -56,5 +56,44 @@ One JSON object per line. Times are numbers in `time_unit` (default `ns`).
 ```
 
 Scenarios are shell commands run from the current directory, with `{trace}` replaced by the
-trace path. In templates, `{key}` is a field's value and `{key?text}` is `text` when the field
+trace path. A scenario can also be `{"run": "...", "trace": "path"}` to write its own trace, such
+as a waveform. In templates, `{key}` is a field's value and `{key?text}` is `text` when the field
 is present and not zero. Types without a profile entry get a color and their fields as `key=value`.
+
+## Waveforms
+
+waterski also reads waveforms (`.vcd`), so hardware needs no trace code. It samples each node's
+AXI-Stream ports on the clock, joins beats into messages, pairs what was received with what was
+sent, and decodes headers with the profile:
+
+```json
+{
+  "wave": {
+    "clock": "top.clk",
+    "nodes": [ { "node": "a", "label": "Board A", "scope": "top.a", "addr": "0a000001" } ],
+    "tx": { "valid": "m_tvalid", "ready": "m_tready", "data": "m_tdata", "keep": "m_tkeep",
+            "last": "m_tlast", "dst": "m_daddr", "fields": { "prio": "m_prio" } },
+    "rx": { "valid": "s_tvalid", "data": "s_tdata", "keep": "s_tkeep", "last": "s_tlast",
+            "error": "s_tuser", "drop": "rx_drop" },
+    "notes": [ { "when": ["done", "!err"], "text": "finished {len} bytes", "count": "done", "flow": "id" } ]
+  },
+  "profile": {
+    "decode": { "type": "11:1", "flow": "20:8&fffffffffffffffe", "flow_label": "RPC" },
+    "types": {
+      "DATA": { "code": 16, "fields": { "off": "48:4" }, "compute": { "last": "off+bytes-53" } }
+    }
+  }
+}
+```
+
+- Signals are relative to each node's `scope`; `tx.dst` is matched against the nodes' `addr` (hex).
+  Data is up to 64 bits, byte 0 in the low bits.
+- `rx.drop` within 4 cycles of a last beat means the receiver discarded that message (a frame
+  error if `rx.error` was set on that beat).
+- Fields are `offset:size` or `offset:size&hexmask`, big-endian, plus `bytes`. `compute` adds sums
+  (`off+bytes-53`), choices (`S?a:b`, `len=0?a:b`) and templates.
+- A note is added on every clock edge where its `when` signals are 1 (`!name`: 0).
+
+Copies with identical bytes are indistinguishable, so "first copy lost, second duplicated" reads
+as "both arrived"; a different message of the same length counts as a corrupted copy. Messages
+lost or still in flight when the recording ends show as "never arrived".
